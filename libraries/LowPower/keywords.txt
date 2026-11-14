@@ -9,6 +9,7 @@
 LowPower	KEYWORD1	LowPower
 LowPowerClass	KEYWORD1
 WakeReason	KEYWORD1
+RunSpeed	KEYWORD1
 
 #######################################
 # Methods and Functions (KEYWORD2)
@@ -21,6 +22,9 @@ keepPins	KEYWORD2
 setPinRestore	KEYWORD2
 lastSleepMs	KEYWORD2
 wakeReason	KEYWORD2
+setRunSpeed	KEYWORD2
+runSpeed	KEYWORD2
+setRunSpeedCallback	KEYWORD2
 
 #######################################
 # Constants (LITERAL1)
@@ -28,4 +32,8 @@ wakeReason	KEYWORD2
 SLEEP_UNKNOWN	LITERAL1
 WAKE_NONE	LITERAL1
 WAKE_PIN	LITERAL1
+RUN_FULL	LITERAL1
+RUN_48M	LITERAL1
+RUN_12M	LITERAL1
+RUN_6M	LITERAL1
 WAKE_TIMER	LITERAL1

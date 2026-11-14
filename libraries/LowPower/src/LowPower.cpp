@@ -43,6 +43,7 @@ static bool cyw43Powered() {
 #include <hardware/pll.h>
 #include <hardware/timer.h>
 #include <hardware/uart.h>
+#include <hardware/i2c.h>
 #include <hardware/xosc.h>
 #include <hardware/structs/rosc.h>
 #if defined(NO_USB)
@@ -272,6 +273,117 @@ static void lightSleepClocksUp() {
     }
 }
 #endif
+
+// ---- run speed: presets for the system clock while awake.  RUN_48M: PLL_SYS at 48 MHz.  RUN_12M / RUN_6M ("slim"): clk_sys from the crystal (divided for 6 MHz), PLL_SYS,
+// PLL_USB and clk_usb (NO_USB builds; clk_adc runs from the crystal) and the ring oscillator stopped (about the state the light sleeps use, plus the CPU running).  RUN_FULL: the board's F_CPU, everything back on.
+static uint32_t rsRoscCtrl;
+static bool rsSlim;
+
+static uint32_t rsSnap(uint32_t v, const uint32_t *list, int n) {
+    for (int i = 0; i < n; i++) {
+        const uint32_t d = v > list[i] ? v - list[i] : list[i] - v;
+        if (d * 100 <= list[i] * 3) {
+            return list[i];
+        }
+    }
+    return v;
+}
+
+struct RsPeriph {
+    uint32_t uart[2];
+    uint32_t i2c[2];
+};
+
+static uart_inst_t *const rsUart[2] = {uart0, uart1};
+static i2c_inst_t *const rsI2c[2] = {i2c0, i2c1};
+
+// Read the current baud rates and I2C clocks back from the hardware registers (nobody else keeps them) and snap them to the usual values.
+static void rsCapture(RsPeriph &p) {
+    static const uint32_t bauds[] = {1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600, 1000000, 2000000, 3000000};
+    static const uint32_t clocks[] = {100000, 400000, 1000000};
+    const uint32_t peri = clock_get_hz(clk_peri);
+    for (int i = 0; i < 2; i++) {
+        p.uart[i] = 0;
+        uart_hw_t *hw = uart_get_hw(rsUart[i]);
+        if (hw->cr & UART_UARTCR_UARTEN_BITS) {
+            const uint32_t div = hw->ibrd * 128 + hw->fbrd * 2;
+            if (div) {
+                p.uart[i] = rsSnap((uint32_t)(((uint64_t)8 * peri + div / 2) / div), bauds, sizeof(bauds) / sizeof(bauds[0]));
+            }
+        }
+        p.i2c[i] = 0;
+        i2c_hw_t *ih = i2c_get_hw(rsI2c[i]);
+        if (ih->enable & 1) {
+            const bool standard = ((ih->con & I2C_IC_CON_SPEED_BITS) >> I2C_IC_CON_SPEED_LSB) == 1;
+            const uint32_t period = standard ? (ih->ss_scl_hcnt + ih->ss_scl_lcnt) : (ih->fs_scl_hcnt + ih->fs_scl_lcnt);
+            if (period) {
+                p.i2c[i] = rsSnap((peri + period / 2) / period, clocks, 3);
+            }
+        }
+    }
+}
+
+static void rsRetime(const RsPeriph &p) {
+    for (int i = 0; i < 2; i++) {
+        if (p.uart[i]) {
+            uart_set_baudrate(rsUart[i], p.uart[i]);
+        }
+        if (p.i2c[i]) {
+            i2c_set_baudrate(rsI2c[i], p.i2c[i]);
+        }
+    }
+}
+
+// Back to the board's F_CPU with every clock running, from any run speed.
+static void rsToFull() {
+    if (rsSlim) {
+        rosc_hw->ctrl = rsRoscCtrl;
+        while (!(rosc_hw->status & ROSC_STATUS_STABLE_BITS)) {
+        }
+        runtime_init_clocks(); // PLLs, clk_usb, clk_adc and clk_sys at the SDK defaults
+        rsSlim = false;
+    }
+    if (clock_get_hz(clk_sys) != (uint32_t)F_CPU) {
+        __applyCoreClockConfig(); // VREG / PSRAM timing and the clock for a non-default F_CPU; does nothing when F_CPU is the SDK default
+        if (clock_get_hz(clk_sys) != (uint32_t)F_CPU) {
+            set_sys_clock_khz(F_CPU / 1000, true);
+        }
+    }
+    clock_configure(clk_peri, 0, CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLK_SYS, F_CPU, F_CPU);
+}
+
+static void rsSlimDown(uint32_t hz) {
+    clock_configure_undivided(clk_ref, CLOCKS_CLK_REF_CTRL_SRC_VALUE_XOSC_CLKSRC, 0, XOSC_HZ);
+    clock_configure(clk_sys, CLOCKS_CLK_SYS_CTRL_SRC_VALUE_CLK_REF, 0, XOSC_HZ, hz);
+    clock_configure(clk_peri, 0, CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLK_SYS, hz, hz);
+#if defined(NO_USB)
+    // nothing uses the USB controller: its clocks stop.  The ADC keeps a clock (the crystal): touching its registers without one is a bus fault, analogRead() included.
+    clock_configure(clk_adc, 0, CLOCKS_CLK_ADC_CTRL_AUXSRC_VALUE_XOSC_CLKSRC, XOSC_HZ, XOSC_HZ);
+    clock_stop(clk_usb);
+    pll_deinit(pll_sys);
+    pll_deinit(pll_usb);
+#else
+    // with a USB stack in the build PLL_USB, clk_usb and clk_adc stay on (the stack reads the controller)
+    pll_deinit(pll_sys);
+#endif
+    if (!rsSlim) { // already slim (12M <-> 6M): the saved value is the one from before the ring oscillator was stopped
+        rsRoscCtrl = rosc_hw->ctrl;
+        rosc_hw->ctrl = (rsRoscCtrl & ~ROSC_CTRL_ENABLE_BITS) | (ROSC_CTRL_ENABLE_VALUE_DISABLE << ROSC_CTRL_ENABLE_LSB);
+        while (rosc_hw->status & ROSC_STATUS_STABLE_BITS) {
+        }
+    }
+    rsSlim = true;
+}
+
+static bool rsUsbInUse() {
+#if defined(NO_USB)
+    return false;
+#elif defined(USE_TINYUSB)
+    return true;
+#else
+    return tud_connected() && !tud_suspended();
+#endif
+}
 #else
 static inline void lightSleepClocksDown() {}
 static inline void lightSleepClocksUp() {}
@@ -311,6 +423,16 @@ void LowPowerClass::enter() {
     if (setup1 || loop1) {
         rp2040.idleOtherCore();
     }
+#if LP_LIGHT_SLEEP_CLOCKS
+    if (_runSpeed != RUN_FULL) {
+        // every sleep starts from the full-speed state; leave() puts the run speed back
+        RsPeriph p;
+        waitUartsIdle();
+        rsCapture(p);
+        rsToFull();
+        rsRetime(p);
+    }
+#endif
 }
 
 void LowPowerClass::leave() {
@@ -324,6 +446,14 @@ void LowPowerClass::leave() {
     // The SDK's dormant calls return with the processor's deep sleep bit still set (they set it and, unlike its sleep calls, never clear it): clear it, so that a later
     // WFI / WFE (sleep_ms(), a blocking queue, the sketch's own) is the ordinary sleep it was before the call.
     lpDeepSleepOff();
+#if LP_LIGHT_SLEEP_CLOCKS
+    if (_runSpeed != RUN_FULL) {
+        applyRunSpeed(_runSpeed);
+        if (_runCallback) {
+            _runCallback(_runSpeed);
+        }
+    }
+#endif
     // Pins go back after the clocks, before the sketch (and core 1) runs again
     unparkPins();
     if (setup1 || loop1) {
@@ -579,6 +709,79 @@ int LowPowerClass::sleepUntilPinImpl(pin_size_t pin, PinStatus mode, uint32_t ti
     _wakeReason = lpPinFired ? WAKE_PIN : WAKE_TIMER;
     _lastSleepMs = (uint32_t)((t1 - t0 + 500) / 1000);
     return 0;
+}
+
+// Put the clocks in the state of `speed` (from any state) and re-time the UART / I2C clocks.  No policy checks (setRunSpeed() does them).
+int LowPowerClass::applyRunSpeed(RunSpeed speed) {
+#if LP_LIGHT_SLEEP_CLOCKS
+    RsPeriph p;
+    waitUartsIdle();
+    rsCapture(p);
+    int rc = 0;
+    switch (speed) {
+    case RUN_FULL:
+        rsToFull();
+        break;
+    case RUN_48M:
+        rsToFull();
+        if (!set_sys_clock_khz(48000, false)) {
+            rc = PICO_ERROR_INVALID_ARG;
+            break;
+        }
+        set_sys_clock_khz(48000, true);
+        clock_configure(clk_peri, 0, CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLK_SYS, 48000000, 48000000);
+        break;
+    case RUN_12M:
+        rsSlimDown(12000000);
+        break;
+    case RUN_6M:
+        rsSlimDown(6000000);
+        break;
+    default:
+        rc = PICO_ERROR_INVALID_ARG;
+    }
+    if (rc == 0) {
+        rsRetime(p);
+    }
+    return rc;
+#else
+    (void)speed;
+    return PICO_ERROR_NOT_PERMITTED;
+#endif
+}
+
+int LowPowerClass::setRunSpeed(RunSpeed speed) {
+#ifdef __FREERTOS
+    (void)speed;
+    return PICO_ERROR_NOT_PERMITTED; // the system clock sets FreeRTOS's tick (SysTick) rate: not supported, see docs/lowpower.rst
+#endif
+#if LP_LIGHT_SLEEP_CLOCKS
+    if (speed != RUN_FULL && speed != RUN_48M && speed != RUN_12M && speed != RUN_6M) {
+        return PICO_ERROR_INVALID_ARG;
+    }
+    if (speed == _runSpeed) {
+        return 0;
+    }
+    if (speed != RUN_FULL && rsUsbInUse()) {
+        return PICO_ERROR_NOT_PERMITTED;
+    }
+#if defined(PICO_CYW43_SUPPORTED)
+    if (speed != RUN_FULL && cyw43Powered()) {
+        return PICO_ERROR_NOT_PERMITTED; // the WiFi chip's PIO SPI only works at full speed (measured: a joined connection stops answering at 48 MHz, a join started at 48 MHz fails)
+    }
+#endif
+    int rc = applyRunSpeed(speed);
+    if (rc == 0) {
+        _runSpeed = speed;
+        if (_runCallback) {
+            _runCallback(speed);
+        }
+    }
+    return rc;
+#else
+    (void)speed;
+    return PICO_ERROR_NOT_PERMITTED;
+#endif
 }
 
 int LowPowerClass::sleepFor(uint32_t ms) {

@@ -163,7 +163,68 @@ public:
     enum KeepRunningMask { KR_PWM = 1, KR_PIO = 2, KR_UART0 = 4, KR_UART1 = 8, KR_ADC = 16, KR_DMA = 32 };
     void keepRunning(uint32_t mask);
 
+    /**
+        @brief Run speeds for setRunSpeed().  Use as LowPower.RUN_6M (or LowPowerClass::RUN_6M).
+    */
+    enum RunSpeed {
+        RUN_FULL = 0, /**< the board's F_CPU, everything on (the default after every boot) */
+        RUN_48M,      /**< 48 MHz from PLL_SYS */
+        RUN_12M,      /**< 12 MHz from the crystal; PLL_SYS and the ring oscillator are stopped, with NO_USB also PLL_USB and clk_usb ("slim") */
+        RUN_6M        /**< 6 MHz from the crystal, slim */
+    };
+
+    /**
+        @brief Run the CPU slower while awake (RP2040, RP2350 Arm).
+
+        A sketch that has to stay awake but has little to do (waiting for a serial line, blinking, polling a
+        sensor) draws far less at 6 MHz from the crystal than at full speed: Pico 2 W 17 mA -> 3 mA, Pico W
+        (RP2040) 25 mA -> 2.4 mA (docs/lowpower.rst).  A sleep (sleepFor(), sleepUntilPin(), dormantFor() ...)
+        is still cheaper than running slowly whenever the CPU can wait: use this where it cannot.
+
+        After the change the baud rates of Serial1 / Serial2 (UART0 / UART1) and the I2C clocks of Wire / Wire1
+        are set again for the new peripheral clock; SPI re-times itself on every transaction, analogWrite()
+        recomputes its divider on every call (call it again after a change), tone() reads the speed on every
+        call.  PIO programs, Servo, I2S, SerialPIO and PWM set up with analogWriteFreq() keep the divider they
+        were started with and run at a different rate: re-initialise them from the callback of
+        setRunSpeedCallback() (it also runs after every sleep, see below).  millis(), micros() and delay() are not
+        affected.  analogRead() works in every preset (the ADC clock runs from the crystal in the slim presets of
+        a NO_USB build, from PLL_USB in a build with the USB stack, which keeps PLL_USB and clk_usb on and so
+        draws about 2.5 mA more).  Flash is read at the new clock (slower code, not a problem for the 12 and 6 MHz presets).
+
+        Sleep calls (all forms) bring the chip back to RUN_FULL first and restore the current run speed after
+        the wake.
+
+        Not permitted (PICO_ERROR_NOT_PERMITTED): while USB is in use (the USB stack is connected and not
+        suspended), with a build that has no light-sleep clock gating (RP2350 RISC-V), and every speed other
+        than RUN_FULL while the WiFi chip is powered: its PIO SPI only works at full speed (a joined connection
+        stops answering when the clock changes, a join started at 48 MHz fails).  On a Pico W / Pico 2 W call
+        WiFi.powerOff() first, run slowly, go back to RUN_FULL, then WiFi.powerOn() (re-joins), and do not
+        call WiFi.begin() while a slow speed is set.
+
+        @param [in] speed RUN_FULL, RUN_48M, RUN_12M or RUN_6M
+        @return 0 on success, PICO_ERROR_NOT_PERMITTED or PICO_ERROR_INVALID_ARG
+    */
+    int setRunSpeed(RunSpeed speed);
+
+    /** @return the current run speed (RUN_FULL after a boot) */
+    RunSpeed runSpeed() const {
+        return _runSpeed;
+    }
+
+    /**
+        @brief Function called after every successful setRunSpeed() and after every sleep that restored a run
+        speed other than RUN_FULL, with the run speed in effect.  Use it to re-initialise what the library cannot
+        re-time itself (PIO programs, SerialPIO, Servo, I2S, PWM frequency set with analogWriteFreq()).  Pass nullptr
+        to remove it.
+    */
+    void setRunSpeedCallback(void (*callback)(RunSpeed speed)) {
+        _runCallback = callback;
+    }
+
 private:
+    RunSpeed _runSpeed = RUN_FULL;
+    void (*_runCallback)(RunSpeed) = nullptr;
+    int applyRunSpeed(RunSpeed speed);
     uint64_t _keepMask = 0;
     bool _restore = true;
     bool _saved = false;
