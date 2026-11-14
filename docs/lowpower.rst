@@ -265,6 +265,67 @@ A kept peripheral makes the sleep a 7 to 12 mA one, so a timed wake loop (sleep,
 peripheral.  On the RP2350's RISC-V cores the library does not stop the PLLs at all, so the mask only keeps the peripheral clocks.  Not
 measured on the RP2040.  The mask has no effect on the CYW43 handling: the driver's lock is held around every sleep either way.
 
+Running slowly: setRunSpeed()
+-----------------------------
+
+Sleeping is the cheapest way to wait.  When the sketch has to stay awake but has little to do (waiting for a
+serial line, blinking, polling a sensor), the CPU can run slower:
+
+.. code-block:: c++
+
+    int LowPower.setRunSpeed(LowPower.RUN_FULL | RUN_48M | RUN_12M | RUN_6M);   // one of them; 0 or PICO_ERROR_*
+    LowPower.runSpeed();                                                       // the current one
+    LowPower.setRunSpeedCallback(void (*fn)(LowPowerClass::RunSpeed));        // see below
+
+* ``RUN_FULL`` is the board's ``F_CPU`` with everything on (the default after every boot).  ``RUN_48M`` runs
+  PLL_SYS at 48 MHz.  ``RUN_12M`` and ``RUN_6M`` run from the 12 MHz crystal (divided for 6 MHz) with PLL_SYS and the
+  ring oscillator stopped ("slim"), and with ``NO_USB`` also PLL_USB and ``clk_usb``.  The ADC keeps a clock, so
+  ``analogRead()`` works in every preset.  A build with the USB stack keeps PLL_USB, ``clk_usb`` and ``clk_adc`` on in
+  the slim presets (about 1.5 to 2.5 mA more).
+* The baud rates of ``Serial1`` / ``Serial2`` (UART0 / UART1) and the I2C clocks of ``Wire`` / ``Wire1`` are set
+  again after every change (the library reads them back from the hardware).  ``SPI`` re-times itself on every
+  transaction, ``analogWrite()`` computes its divider on every call (call it again after a change), ``tone()`` reads the
+  speed on every call, ``millis()``, ``micros()`` and ``delay()`` are not affected.  PIO programs, ``SerialPIO``,
+  ``Servo``, I2S and a PWM frequency set with ``analogWriteFreq()`` keep the divider they were started with and run at a
+  different rate: start them again from the callback of ``setRunSpeedCallback()``, which runs after every change and after
+  every sleep that restored a slow speed (``SerialPIO``: ``end()`` and ``begin()`` with the same baud rate).
+* Every sleep call brings the chip back to ``RUN_FULL`` first and restores the current run speed after the wake.
+* ``PICO_ERROR_NOT_PERMITTED``: while USB is in use (the USB stack is connected and not suspended), in a build without
+  light-sleep clock gating (RP2350 RISC-V), in a build with FreeRTOS (the system clock sets FreeRTOS's tick rate), and for every speed except ``RUN_FULL`` while the WiFi chip of a Pico W /
+  Pico 2 W is powered, which includes Bluetooth, since both use the same chip (its PIO SPI only works at full speed: a joined connection stopped answering at 48 MHz and a join
+  started at 48 MHz failed).  Call ``WiFi.powerOff()`` first, run slowly, go back to ``RUN_FULL``, then ``WiFi.powerOn()``
+  (do not call ``WiFi.begin()`` at a slow speed).
+* Code runs from flash at the new clock.  The core voltage is not part of the API: the measured floors below are for a
+  sketch that wants to call ``vreg_set_voltage()`` itself (on the RP2350 lower the brown-out threshold first, it
+  defaults to 0.946 V and resets the chip below that).
+
+Measured (INA226 means at VSYS, 3.7 V, no USB, ``Serial1`` and the loopbacks checked after every change; a task of
+2 million float iterations as the CPU load):
+
++-------------------+--------------+---------+-----------+-----------+-----------------+
+| Pico 2 W, 150 MHz | idle (delay) | busy    | SPI 1 MHz | task time | energy per task |
++===================+==============+=========+===========+===========+=================+
+| ``RUN_FULL``      | 17.3 mA      | 20.4 mA | 20.3 mA   | 0.23 s    | 4.6 mC          |
++-------------------+--------------+---------+-----------+-----------+-----------------+
+| ``RUN_48M``       | 8.4 mA       | 9.5 mA  | 9.5 mA    | 0.71 s    | 6.8 mC          |
++-------------------+--------------+---------+-----------+-----------+-----------------+
+| ``RUN_12M``       | 3.4 mA       | 3.6 mA  | 3.7 mA    | 2.87 s    | 10.4 mC         |
++-------------------+--------------+---------+-----------+-----------+-----------------+
+| ``RUN_6M``        | 3.0 mA       | 3.1 mA  | 3.1 mA    | 5.82 s    | 18.0 mC         |
++-------------------+--------------+---------+-----------+-----------+-----------------+
+
+The plain Pico 2 (1.1 V core, PLL_USB and the ring oscillator stopped) measured 15.6 / 7.4 / 2.5 /
+1.7 mA idle at 150 / 48 / 12 / 6 MHz; the Pico W (RP2040, 125 MHz default) 25 / 14 / 3.1 / 2.4 mA idle at 125 /
+48 / 12 / 6 MHz.  With the USB stack in the build the slim presets of a Pico 2 W idle at 4.9 mA (12 MHz) and 4.2 mA (6 MHz).
+A lower core voltage helps at the high speeds on the RP2040 (125 MHz: 25 mA at 1.1 V, 21 mA at 0.9 V; 0.85 V hangs;
+48 and 12 MHz hang at 0.80 V) and was not worth much on the RP2350 (0.9 V ran at 150 MHz, 0.8 V at 48 MHz and below).
+
+**Sleeping beats running slowly.**  A task costs more charge the slower it runs (the 2 M iteration task above: 4.6 mC
+at full speed, 18 mC at 6 MHz), and the sleep floor of the board (Pico 2 W 2.7 to 4.5 mA light sleep, Pico W 1.6 mA,
+plain Pico 2 about 2.5 mA, RP2350 deep sleep 0.2 mA) is at or below the idle current of the slim presets.  Racing a
+task at full speed and sleeping for the rest of a period used 34 mC per 14 s on the Pico W against 46 mC at 12 MHz.
+Use ``setRunSpeed()`` where the CPU cannot wait: it takes an idle sketch from 17 to 3 mA, not further.
+
 Examples
 --------
 
@@ -272,3 +333,4 @@ Examples
 * ``SleepPinOrTimeout`` - light sleep until a pin or a timeout.
 * ``DormantUntilPin`` - go dormant until GP15 is pulled low.
 * ``KeepRunningPWM`` - keep a PWM output running during a ``sleepFor``.
+* ``RunSpeedIdle`` - stay awake at 6 MHz and print once a second.
