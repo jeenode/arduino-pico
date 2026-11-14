@@ -12,12 +12,26 @@
 #pragma once
 
 #include <Arduino.h>
+#include <time.h>
 
 /**
     @brief Low-power modes.  All functions return 0 on success or a (negative)
     Pico SDK error code (PICO_ERROR_*, see pico/error.h) on failure.  With the FreeRTOS SMP
     operating system option every sleep and dormant call returns PICO_ERROR_NOT_PERMITTED.
 */
+/**
+    @brief Declare a variable that survives LowPower.deepSleepFor() / deepSleepUntilPin():  uint32_t LOWPOWER_RETAINED(counter);
+
+    RP2350 only.  The variable is placed in the persistent data section: it is zero after every reset that is not a wake from deep sleep
+    (power on, RUN pin, watchdog, upload) and keeps its value through deep sleep.  It cannot have an initializer other than zero.  On the RP2040
+    (no deep sleep) it expands to an ordinary variable.
+*/
+#if defined(PICO_RP2350) && PICO_RP2350
+#define LOWPOWER_RETAINED(name) __attribute__((section(".persistent_data." #name))) name
+#else
+#define LOWPOWER_RETAINED(name) name
+#endif
+
 class LowPowerClass {
 public:
     /**
@@ -98,6 +112,55 @@ public:
     int dormantFor(uint32_t ms);
 
     /**
+        @brief Deep sleep (RP2350 only): switched-core power-down, the SDK's "Pstate".  Returns PICO_ERROR_NOT_PERMITTED on the RP2040.
+
+        The core, the clocks, the peripherals and all SRAM except the retained variables (LOWPOWER_RETAINED) are powered off: the board draws about
+        0.2 mA (Pico 2 W) against about 3.7 mA in dormant.  The wake is a REBOOT: the call does not return on success, setup() runs again from the
+        start, variables are reset (except the retained ones), peripherals, pins and USB must be set up again, millis() restarts at 0.  On a Pico 2 W a
+        powered WiFi chip is switched off (WL_ON low) first, otherwise it would keep drawing about 47 mA; the connection is lost and has to be made again.  Pins are parked as in dormant.
+        A wake costs about 0.6 mC and 0.12 s (reboot), so deep sleep pays against light sleep for sleeps longer than about 0.2 s.
+
+        deepSleepFor() wakes from the AON timer (ms must be at least 10).  deepSleepUntilPin() wakes on a GPIO condition (LOW / HIGH level, or
+        RISING / FALLING / CHANGE edge; use an external pull-down with RISING, see RP2350-E9); there is no timeout form (the SDK offers either).
+
+        @return only on an error: a negative SDK error code
+    */
+    int deepSleepFor(uint32_t ms);
+    int deepSleepUntilPin(pin_size_t pin, PinStatus mode);
+
+    /** @brief true if this boot is the wake from a deepSleepFor() / deepSleepUntilPin() (not a power on, reset or watchdog reboot).  Always false on the RP2040. */
+    bool wokeFromDeepSleep() const;
+
+    /**
+        @brief Wall-clock time that survives deep sleep (RP2350).
+
+        setTime() starts the always-on (POWMAN) timer at `epoch` and sets the system time (time(), gettimeofday()).  The timer keeps counting in deep sleep, dormant and across
+        RUN-pin resets; when it is running at startup the system time is set from it, so time() is right after every wake without a resync.  In deep sleep and dormant it
+        runs from the on-chip low-power oscillator (about 32 kHz, tolerance of tens of percent unless calibrated), awake from the crystal.
+    */
+    void setTime(time_t epoch);
+    /** @return true if the always-on timer is running (setTime() was called since the last power-up) */
+    bool timeValid() const;
+    /** Set the system time from the always-on timer (done at startup and after dormant automatically). */
+    void syncTime();
+    /** @return the always-on timer in milliseconds since its start value (the epoch given to setTime(), in ms) */
+    uint64_t aonMs() const;
+    /**
+        @brief Trim of the always-on timer's low-power oscillator, in parts per million (RP2350).
+
+        The oscillator runs the timer in deep sleep and dormant; its frequency is set from the chip's OTP calibration, and measured on a Pico 2 the timer was still about 5400 ppm slow
+        in deep sleep (0.54 %, 20 s per hour).  setTimeTrimPpm(5400) makes it count that much faster.  Kept in POWMAN scratch register 5 (survives deep sleep, lost at power-up), applied at the next
+        deep sleep entry only: awake and in light sleep the timer counts from the crystal, and in dormant the same oscillator ran about 1500 ppm fast, so dormant uses the untrimmed value.
+        It is the trim of one chip at room temperature: measure it against NTP over a few deep sleeps.
+    */
+    void setTimeTrimPpm(int32_t ppm);
+    /** @return the trim set with setTimeTrimPpm(), 0 if none */
+    int32_t timeTrimPpm() const;
+
+    /** @brief What woke the chip: WAKE_TIMER or WAKE_PIN after a deep sleep, WAKE_NONE if this boot is not a wake from deep sleep. */
+    WakeReason deepSleepWakeReason() const;
+
+    /**
         @brief GPIOs to leave untouched by the dormant low-leakage parking.
 
         The wake pin and any pin muxed to a UART or I2C are always left alone.
@@ -162,6 +225,19 @@ public:
     */
     enum KeepRunningMask { KR_PWM = 1, KR_PIO = 2, KR_UART0 = 4, KR_UART1 = 8, KR_ADC = 16, KR_DMA = 32 };
     void keepRunning(uint32_t mask);
+
+    /**
+        @brief Supply voltage (VSYS) in volts, from GP29 (VSYS / 3 through a 200 k + 100 k divider on the Pico and Pico 2).
+
+        Averages `samples` 12-bit readings.  Untrimmed the result is about 1.4 % low on a Pico 2 (3.3 V ADC reference assumed); setVsysTrim() corrects gain and offset.
+        On a Pico W / Pico 2 W GP29 is the WiFi chip's clock while the chip is powered: the call returns NAN then (use WiFi.powerOff() first).  Not thread-safe against another
+        core using analogRead().  The ADC stays enabled afterwards (about 0.15 mA).
+        @param [in] samples number of readings to average (default 16)
+        @return volts, or NAN
+    */
+    float readVsys(int samples = 16);
+    /** Volts = counts * (3.3 * 3 / 4096) * gain + offsetVolts.  On a Pico 2: gain 0.995, offset +0.077 V (fit against a PPK2 source, 3.2 to 5 V, within 12 mV). */
+    void setVsysTrim(float gain, float offsetVolts);
 
 private:
     uint64_t _keepMask = 0;

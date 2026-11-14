@@ -9,6 +9,12 @@
 
 #include "LowPower.h"
 #include <pico/low_power.h>
+#include <pico/aon_timer.h>
+#if PICO_RP2350
+#include <hardware/powman.h>
+#endif
+#include <hardware/adc.h>
+#include <math.h>
 #include <hardware/gpio.h>
 #include <pico/error.h>
 #include <hardware/clocks.h>
@@ -18,6 +24,11 @@
 #include <hardware/irq.h>
 #include <hardware/sync.h>
 #include <hardware/timer.h>
+#if PICO_RP2350
+#include <hardware/powman.h>
+#include <hardware/regs/powman.h>
+#include <hardware/structs/powman.h>
+#endif
 #if defined(PICO_CYW43_SUPPORTED)
 #include <pico/cyw43_arch.h>
 // The WiFi chip is powered (and its driver running) while the core drives WL_ON high: set when the driver first brings the chip up,
@@ -429,6 +440,9 @@ static void lpKeepClocks(clock_dest_bitset_t *keep) {
 #else
     clock_dest_bitset_add(keep, timer_get_index(timer_hw) ? CLK_DEST_SYS_TIMER1 : CLK_DEST_SYS_TIMER0);
     clock_dest_bitset_add(keep, CLK_DEST_REF_TICKS);
+    if (aon_timer_is_running()) {
+        clock_dest_bitset_add(keep, CLK_DEST_REF_POWMAN);      // keep the always-on timer counting (its 1 kHz tick is the crystal while awake and in light sleep)
+    }
 #endif
     // as the SDK's sleep keeps them: UART0 (Serial1 keeps receiving, so a byte can be the wake source) and the USB controller (connection survives)
     clock_dest_bitset_add(keep, CLK_DEST_SYS_UART0);
@@ -500,6 +514,15 @@ int LowPowerClass::sleepUntilPin(pin_size_t pin, PinStatus mode) {
     return sleepUntilPinImpl(pin, mode, 0, false);
 }
 
+// A wake pin the sketch never configured is still isolated on the RP2350 (pad ISO set, function NULL) and never produces the wake event.  Give it the SIO function (which
+// clears the isolation) and turn the input on; a pull the sketch has set stays as it is.
+static void prepWakePin(uint pin) {
+    if (gpio_get_function(pin) == GPIO_FUNC_NULL) {
+        gpio_set_function(pin, GPIO_FUNC_SIO);
+    }
+    gpio_set_input_enabled(pin, true);
+}
+
 int LowPowerClass::sleepUntilPinImpl(pin_size_t pin, PinStatus mode, uint32_t timeoutMs, bool timed) {
     bool edge, high;
     _lastSleepMs = 0;
@@ -539,7 +562,7 @@ int LowPowerClass::sleepUntilPinImpl(pin_size_t pin, PinStatus mode, uint32_t ti
     if (timed) {
         timer_hardware_alarm_set_callback(timer_hw, alarm, lpAlarmHandler);
     }
-    gpio_set_input_enabled(pin, true);
+    prepWakePin(pin);
     gpio_add_raw_irq_handler(pin, lpGpioHandler);
     gpio_set_irq_enabled(pin, event, true);
     irq_set_enabled(IO_IRQ_BANK0, true);
@@ -601,9 +624,17 @@ int LowPowerClass::sleepFor(uint32_t ms) {
     }
 #endif
     lightSleepClocksDown();
-    clock_dest_bitset_t userKeep = clock_dest_bitset_none();
-    lpRunClocks(&userKeep);
-    int rc = low_power_sleep_for_ms(ms, lpRunMask ? &userKeep : nullptr, true);
+    // The caller's keepRunning() clocks plus, on the RP2350, the always-on timer's clock while that timer runs.
+    clock_dest_bitset_t keepSet = clock_dest_bitset_none();
+    lpRunClocks(&keepSet);
+    bool haveKeep = lpRunMask != 0;
+#if PICO_RP2350
+    if (aon_timer_is_running()) {
+        clock_dest_bitset_add(&keepSet, CLK_DEST_REF_POWMAN);
+        haveKeep = true;
+    }
+#endif
+    int rc = low_power_sleep_for_ms(ms, haveKeep ? &keepSet : nullptr, true);
     lightSleepClocksUp();
     leave();
 #if defined(PICO_CYW43_SUPPORTED)
@@ -615,6 +646,11 @@ int LowPowerClass::sleepFor(uint32_t ms) {
     _wakeReason = rc ? WAKE_NONE : WAKE_TIMER;
     return rc;
 }
+
+#if PICO_RP2350
+static bool aonSyncNow();
+static volatile bool lpDormant = false;     // set while a dormant call runs; see powman_timer_get_lposc_calib_freq below
+#endif
 
 int LowPowerClass::dormantUntilPin(pin_size_t pin, PinStatus mode) {
     bool edge, high;
@@ -628,12 +664,271 @@ int LowPowerClass::dormantUntilPin(pin_size_t pin, PinStatus mode) {
     }
     enter();
     parkPins(parkMask(pin));
-    // GPIO wake needs no running timer clock, so the plain crystal oscillator source is used on both chips
-    int rc = low_power_dormant_until_gpio_pin_state(pin, edge, high, DORMANT_CLOCK_SOURCE_XOSC, nullptr);
+    prepWakePin(pin);
+    // GPIO wake needs no running timer clock, so the plain crystal oscillator source is used, except on the RP2350 while the always-on timer holds the time:
+    // the crystal is off in dormant, the low-power oscillator keeps that timer counting
+    dormant_clock_source_t pinSrc = DORMANT_CLOCK_SOURCE_XOSC;
+    const clock_dest_bitset_t *pinKeep = nullptr;
+#if PICO_RP2350
+    clock_dest_bitset_t keepPowman = clock_dest_bitset_none();
+    const bool aonRunning = aon_timer_is_running();
+    if (aonRunning) {
+        pinSrc = DORMANT_CLOCK_SOURCE_LPOSC;
+        lpDormant = true;
+        powman_timer_set_1khz_tick_source_lposc();              // as the SDK's dormant-for-ms does: the timer counts from the low-power oscillator while dormant
+        clock_dest_bitset_add(&keepPowman, CLK_DEST_REF_POWMAN);
+        pinKeep = &keepPowman;
+    }
+#endif
+    int rc = low_power_dormant_until_gpio_pin_state(pin, edge, high, pinSrc, pinKeep);
     leave();
+#if PICO_RP2350
+    lpDormant = false;
+    if (aonRunning) {
+        powman_timer_set_1khz_tick_source_xosc();
+    }
+    aonSyncNow();                                   // the system timer stopped in dormant, the always-on timer did not
+#endif
     _lastSleepMs = rc ? 0 : SLEEP_UNKNOWN;
     _wakeReason = rc ? WAKE_NONE : WAKE_PIN;
     return rc;
+}
+
+#if PICO_RP2350
+// ---- deep sleep: switched-core power-down through the SDK's Pstate calls ----
+// The reset reason and the wake source are read once, here, before anything can clear them (the SDK's runtime init has already run).
+static const uint32_t dsChipReset = powman_hw->chip_reset;
+static const uint32_t dsPwrup = powman_hw->last_swcore_pwrup;
+
+#include <hardware/regs/otp_data.h>
+extern "C" void __setSystemTime(unsigned long long sec, unsigned long usec);
+
+// The always-on timer keeps wall-clock time across deep sleep.  If it is running at startup the system time is taken from it.
+static bool aonSyncNow() {
+    if (!aon_timer_is_running()) {
+        return false;
+    }
+    struct timespec ts;
+    aon_timer_get_time(&ts);
+    __setSystemTime((unsigned long long)ts.tv_sec, (unsigned long)(ts.tv_nsec / 1000));
+    return true;
+}
+static const bool aonSyncedAtStartup = aonSyncNow();
+
+void LowPowerClass::setTime(time_t epoch) {
+    struct timespec ts;
+    ts.tv_sec = epoch;
+    ts.tv_nsec = 0;
+    if (aon_timer_is_running()) {
+        aon_timer_set_time(&ts);
+    } else {
+        aon_timer_start(&ts);
+    }
+    __setSystemTime((unsigned long long)epoch, 0);
+}
+bool LowPowerClass::timeValid() const {
+    return aon_timer_is_running();
+}
+void LowPowerClass::syncTime() {
+    aonSyncNow();
+}
+uint64_t LowPowerClass::aonMs() const {
+    return powman_timer_get_ms();
+}
+
+// Trim of the always-on timer while it runs from the low-power oscillator (deep sleep, dormant): the SDK sets the oscillator frequency at every deep-sleep entry from the
+// chip's OTP calibration; this replaces its weak function so a trim, kept in POWMAN scratch register 5 (always-on, survives deep sleep), is applied on top of that value.
+// Positive ppm = the timer counts faster.  Measured on a Pico 2 the timer was 5400 ppm slow in deep sleep without a trim.
+// The trim is the one of the deep-sleep oscillator rate only.  Measured on a Pico 2: with the OTP value alone the timer ran 5050 ppm slow in deep sleep but 1500 ppm FAST in dormant (the oscillator
+// runs at a different rate with the core powered), so the deep-sleep trim made dormant 6900 ppm fast.  lpDormant is set around the dormant calls, which then get the plain OTP value.
+static const uint32_t LP_TRIM_VALID = 0x80000000u;
+extern "C" uint32_t powman_timer_get_lposc_calib_freq(void) {
+    uint32_t f = 0;
+    uint16_t otp = *((volatile uint16_t *)OTP_DATA_BASE + OTP_DATA_LPOSC_CALIB_ROW);
+    if (otp >= 20000 && otp <= 50000) {
+        f = otp;
+    }
+    uint32_t t = powman_hw->scratch[5];
+    if ((t & LP_TRIM_VALID) && !lpDormant) {
+        int32_t ppm = (int16_t)(t & 0xffffu);
+        if (!f) {
+            f = 32768;
+        }
+        f = (uint32_t)((double)f * (1.0 - (double)ppm / 1e6) + 0.5);
+    }
+    return f;
+}
+void LowPowerClass::setTimeTrimPpm(int32_t ppm) {
+    if (ppm > 32767) {
+        ppm = 32767;
+    } else if (ppm < -32768) {
+        ppm = -32768;
+    }
+    powman_hw->scratch[5] = LP_TRIM_VALID | ((uint32_t)ppm & 0xffffu);
+}
+int32_t LowPowerClass::timeTrimPpm() const {
+    uint32_t t = powman_hw->scratch[5];
+    return (t & LP_TRIM_VALID) ? (int32_t)(int16_t)(t & 0xffffu) : 0;
+}
+
+bool LowPowerClass::wokeFromDeepSleep() const {
+    return (dsChipReset & POWMAN_CHIP_RESET_HAD_SWCORE_PD_BITS) != 0;
+}
+
+LowPowerClass::WakeReason LowPowerClass::deepSleepWakeReason() const {
+    if (!wokeFromDeepSleep()) {
+        return WAKE_NONE;
+    }
+    if (dsPwrup & (1u << 6)) {                 // alarm_pwrup
+        return WAKE_TIMER;
+    }
+    if (dsPwrup & 0x1E) {                      // pwrup0..3 (GPIO)
+        return WAKE_PIN;
+    }
+    return WAKE_NONE;
+}
+
+// The chip reboots on wake and the WiFi connection is lost anyway: do not leave a powered CYW43 (about 47 mA) running through the sleep.
+// As in sleepFor(), the driver's async context is locked first and stays locked until the chip resets (or deepSleepWifiUnlock() on a failed call), so the
+// driver's worker (WiFi or Bluetooth) cannot touch the chip over PIO SPI while it is switched off and the clocks are lowered.
+static void *deepSleepWifiOff() {
+#if defined(PICO_CYW43_SUPPORTED)
+    if (cyw43Powered()) {
+        async_context_t *ctx = cyw43_arch_async_context();
+        if (ctx) {
+            async_context_acquire_lock_blocking(ctx);
+        }
+        gpio_put(CYW43_PIN_WL_REG_ON, 0);
+        return ctx;
+    }
+#endif
+    return nullptr;
+}
+
+static void deepSleepWifiUnlock(void *ctx) {
+#if defined(PICO_CYW43_SUPPORTED)
+    if (ctx) {
+        async_context_release_lock((async_context_t *)ctx);
+    }
+#else
+    (void)ctx;
+#endif
+}
+
+int LowPowerClass::deepSleepFor(uint32_t ms) {
+    _lastSleepMs = 0;
+    _wakeReason = WAKE_NONE;
+#ifdef __FREERTOS
+    return PICO_ERROR_NOT_PERMITTED; // FreeRTOS owns the tick, the second core and the WiFi driver's tasks: not supported, see docs/lowpower.rst
+#endif
+    if (ms < 10) {
+        return PICO_ERROR_INVALID_ARG;
+    }
+    enter();
+    void *wifiLock = deepSleepWifiOff();
+    parkPins(parkMask(-1));
+    int rc = low_power_pstate_for_ms(ms, nullptr, nullptr);     // does not return on success: the chip reboots when the timer fires
+    leave();
+    deepSleepWifiUnlock(wifiLock);
+    return rc;
+}
+
+int LowPowerClass::deepSleepUntilPin(pin_size_t pin, PinStatus mode) {
+    bool edge, high;
+    _lastSleepMs = 0;
+    _wakeReason = WAKE_NONE;
+#ifdef __FREERTOS
+    return PICO_ERROR_NOT_PERMITTED; // see deepSleepFor()
+#endif
+    if (pin >= NUM_BANK0_GPIOS || !mapPinStatus(mode, &edge, &high)) {
+        return PICO_ERROR_INVALID_ARG;
+    }
+    enter();
+    void *wifiLock = deepSleepWifiOff();
+    parkPins(parkMask(pin));
+    prepWakePin(pin);
+    int rc = low_power_pstate_until_gpio_pin_state(pin, edge, high, nullptr, nullptr);
+    leave();
+    deepSleepWifiUnlock(wifiLock);
+    return rc;
+}
+#else
+// RP2040: no deep sleep (no switched-core power-down)
+void LowPowerClass::setTime(time_t) {
+}
+bool LowPowerClass::timeValid() const {
+    return false;
+}
+void LowPowerClass::syncTime() {
+}
+uint64_t LowPowerClass::aonMs() const {
+    return 0;
+}
+void LowPowerClass::setTimeTrimPpm(int32_t) {
+}
+int32_t LowPowerClass::timeTrimPpm() const {
+    return 0;
+}
+int LowPowerClass::deepSleepFor(uint32_t) {
+    return PICO_ERROR_NOT_PERMITTED;
+}
+
+int LowPowerClass::deepSleepUntilPin(pin_size_t, PinStatus) {
+    return PICO_ERROR_NOT_PERMITTED;
+}
+
+bool LowPowerClass::wokeFromDeepSleep() const {
+    return false;
+}
+
+LowPowerClass::WakeReason LowPowerClass::deepSleepWakeReason() const {
+    return WAKE_NONE;
+}
+#endif
+
+// ---- VSYS: GP29 = VSYS/3 on the Pico and Pico 2 (200 k + 100 k divider, always connected).  Shared with the CYW43 on the W boards.
+static float vsysGain = 1.0f;
+static float vsysOffset = 0.0f;
+
+void LowPowerClass::setVsysTrim(float gain, float offsetVolts) {
+    vsysGain = gain;
+    vsysOffset = offsetVolts;
+}
+
+float LowPowerClass::readVsys(int samples) {
+#if defined(PICO_CYW43_SUPPORTED)
+    if (cyw43Powered()) {
+        return NAN;                    // GP29 is the WiFi chip clock while it is powered: WiFi.powerOff() first
+    }
+    // Pico W / Pico 2 W: with the chip off the divider only reads true while the chip's select line (GPIO25) is high (Pico W: 31 counts, i.e. 0.04 V, instead of 1514, 3.66 V).
+    const gpio_function_t csFunc = gpio_get_function(25);
+    const bool csOut = gpio_is_dir_out(25);
+    const bool csLevel = gpio_get_out_level(25);
+    gpio_init(25);
+    gpio_set_dir(25, GPIO_OUT);
+    gpio_put(25, 1);
+#endif
+    if (samples < 1) {
+        samples = 1;
+    }
+    analogRead(29);                    // lets the core initialise the ADC, the pin and the input mux
+    adc_gpio_init(29);                 // analogRead() sets the pin up only once per boot: after the WiFi chip was used GP29 is a PIO pin (the chip's clock) and read 0 (Pico 2 W)
+    adc_select_input(3);
+    sleep_us(1000);                    // the divider is a 67 k source: conversions right after the pin or the ADC was switched on read low (3 % on the Pico 2)
+    for (int i = 0; i < 8; i++) {
+        (void)adc_read();
+    }
+    uint32_t sum = 0;
+    for (int i = 0; i < samples; i++) {
+        sum += adc_read();
+    }
+    const float counts = (float)sum / samples;
+#if defined(PICO_CYW43_SUPPORTED)
+    gpio_put(25, csLevel);
+    gpio_set_dir(25, csOut);
+    gpio_set_function(25, csFunc);
+#endif
+    return counts * (3.3f * 3.0f / 4096.0f) * vsysGain + vsysOffset;
 }
 
 int LowPowerClass::dormantFor(uint32_t ms) {
@@ -651,8 +946,17 @@ int LowPowerClass::dormantFor(uint32_t ms) {
 #endif
     enter();
     parkPins(parkMask(-1));
+#if PICO_RP2350
+    lpDormant = true;
+#endif
     int rc = low_power_dormant_for_ms(ms, src, nullptr);
+#if PICO_RP2350
+    lpDormant = false;
+#endif
     leave();
+#if PICO_RP2350
+    aonSyncNow();
+#endif
     _lastSleepMs = rc ? 0 : ms;
     _wakeReason = rc ? WAKE_NONE : WAKE_TIMER;
     return rc;
