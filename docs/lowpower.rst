@@ -47,6 +47,9 @@ Light sleep keeps the system timer, and therefore ``millis()``, running.
 clock, a timer) and restarts more slowly (the crystal has to start again, about 73 ms on an RP2040).  USB is shut
 down while dormant.
 
+**Deep sleep** (RP2350 only) powers the cores and the SRAM off, except the variables declared ``LOWPOWER_RETAINED``: the board draws 0.15 to
+0.2 mA and the wake is a reboot (``setup()`` runs again), see "Deep sleep" below.
+
 Every function returns ``0`` on success or a negative Pico SDK error code (``PICO_ERROR_*``, see ``pico/error.h``).
 
 API
@@ -60,6 +63,16 @@ API
     int dormantUntilPin(pin_size_t pin, PinStatus mode);
     int dormantFor(uint32_t ms);
     void keepRunning(uint32_t mask);   // KR_PWM, KR_PIO, KR_UART0, KR_UART1, KR_ADC, KR_DMA: keep these running in sleepFor / sleepUntilPin
+    int deepSleepFor(uint32_t ms);                           // RP2350 only: the wake is a reboot, see "Deep sleep"
+    int deepSleepUntilPin(pin_size_t pin, PinStatus mode);   // RP2350 only
+    bool wokeFromDeepSleep() const;
+    WakeReason deepSleepWakeReason() const;
+    uint32_t LOWPOWER_RETAINED(name);                        // declares a variable that survives deep sleep
+    void setTime(time_t epoch);                              // RP2350: time that survives deep sleep
+    bool timeValid() const;
+    void setTimeTrimPpm(int32_t ppm);
+    float readVsys(int samples = 16);                        // supply voltage, see "Supply voltage"
+    void setVsysTrim(float gain, float offsetVolts);
     void keepPins(uint64_t mask);
     void setPinRestore(bool restore);
     uint32_t lastSleepMs() const;
@@ -82,12 +95,15 @@ API
 +-------------------------+---------------------------+-----------------------------------------+
 | Minimum ``dormantFor``  | 2000 ms                   | 10 ms                                   |
 +-------------------------+---------------------------+-----------------------------------------+
+| ``deepSleepFor``,       | no (``PICO_ERROR_NOT_     | yes, the SDK's switched-core            |
+| ``deepSleepUntilPin``   | PERMITTED``)              | power-down, the wake is a reboot        |
++-------------------------+---------------------------+-----------------------------------------+
 
 Shorter ``dormantFor`` requests return ``PICO_ERROR_INVALID_ARG``.  The RP2040 has no always-on timer that survives
 dormant, so ``dormantFor`` needs a 32 kHz-class clock fed into GPIO 20 or 22 and registered with
 ``low_power_set_external_clock_source()`` before the call; without it ``PICO_ERROR_PRECONDITION_NOT_MET`` is
-returned.  ``dormantUntilPin`` needs no extra hardware.  The RP2350's switched-core power-down (the SDK's "P-state"
-calls) is not wrapped by this library.
+returned.  ``dormantUntilPin`` needs no extra hardware.  The RP2350's switched-core power-down is
+``deepSleepFor`` / ``deepSleepUntilPin`` (see "Deep sleep").
 
 Pins
 ----
@@ -172,8 +188,8 @@ pays off for sleeps longer than roughly 0.1 to 0.3 s, at the price of a wake in 
 +--------------------------------------------+------------------------------------+
 | ``dormantUntilPin``, ``dormantFor``        | 3.3 to 3.9 mA                      |
 +--------------------------------------------+------------------------------------+
-| the SDK's switched-core power-down         | 0.15 mA (not wrapped by the        |
-|                                            | library; the wake is a reboot)     |
+| ``deepSleepFor``, ``deepSleepUntilPin``    | 0.15 to 0.2 mA (the wake is a      |
+|                                            | reboot, see "Deep sleep")          |
 +--------------------------------------------+------------------------------------+
 
 On the RP2350 prefer light sleep: dormant is no lower (the regulator only enters its low-power mode in a power-state
@@ -208,8 +224,8 @@ Caveats
   call: tested on a Pico 2 W with a laptop connected, the link stayed up through ``sleepFor`` of 1, 3 and 10 s,
   ``sleepUntilPin`` and ``dormantUntilPin``, and reads and notifications worked right after each wake (the link layer runs
   in the CYW43, so even a sleep longer than the 9.6 s supervision timeout the laptop chose did not drop it).  Like WiFi it needs the driver's
-  lock held around the sleep, which the library does for every call.
-* **FreeRTOS: not supported.**  In a build with ``Tools->Operating System->FreeRTOS SMP`` every sleep and dormant call returns
+  lock held around the sleep, which the library does for every call.  Deep sleep reboots the chip: the stack is gone after the wake and has to be started again in ``setup()``.
+* **FreeRTOS: not supported.**  In a build with ``Tools->Operating System->FreeRTOS SMP`` every sleep, dormant and deep sleep call returns
   ``PICO_ERROR_NOT_PERMITTED`` and does nothing.  FreeRTOS owns the tick (SysTick), the second core and the WiFi driver's
   tasks, which the calls change underneath it.  Tested on a Pico 2 W: with plain tasks light sleep worked, but the FreeRTOS
   tick does not run asleep (tick counts, ``vTaskDelay()`` and timeouts do not include the sleep); with ``setup1()`` /
@@ -265,6 +281,87 @@ A kept peripheral makes the sleep a 7 to 12 mA one, so a timed wake loop (sleep,
 peripheral.  On the RP2350's RISC-V cores the library does not stop the PLLs at all, so the mask only keeps the peripheral clocks.  Not
 measured on the RP2040.  The mask has no effect on the CYW43 handling: the driver's lock is held around every sleep either way.
 
+Deep sleep (RP2350)
+-------------------
+
+``deepSleepFor(ms)`` and ``deepSleepUntilPin(pin, mode)`` wrap the SDK's switched-core power-down ("Pstate"): the cores, the clocks, the
+peripherals and all SRAM except the retained variables are powered off, the on-chip regulator goes into its low-power mode, and the board
+draws **0.2 mA** (Pico 2 W, 3.7 V) against 3.7 mA in dormant and 2.5 to 4.7 mA in light sleep.  The price is that the wake is a **reboot**:
+the call does not return on success, ``setup()`` runs again, every variable is reset (except the retained ones), the peripherals, pins and
+USB are set up again, ``millis()`` restarts at 0, and a WiFi connection is gone.  A wake takes about 0.12 s to the first line of
+output and costs about 0.6 mC in all.  Compared with the light sleeps, deep sleep uses less once the sleep is longer than about 0.2 to 0.3 s;
+at 10 s the average is 0.3 mA.
+
+.. code:: cpp
+
+    uint32_t LOWPOWER_RETAINED(wakeCount);   // zero after power on or reset, kept through deep sleep
+
+    void setup() {
+      wakeCount++;
+      if (LowPower.wokeFromDeepSleep()) { /* LowPower.deepSleepWakeReason() is WAKE_TIMER or WAKE_PIN */ }
+      // ... do the work ...
+      LowPower.deepSleepFor(10000);          // does not return
+    }
+
+* ``deepSleepFor`` wakes from the always-on timer (at least 10 ms).  ``deepSleepUntilPin`` wakes on a LOW or HIGH level or a RISING or FALLING edge on one pin
+  (a pin the sketch never configured is set up as an input first, a pull the sketch set is kept; on the RP2350 an untouched pad is isolated and would never wake);
+  there is no pin-or-timeout form, the SDK offers one or the other.
+* ``wokeFromDeepSleep()`` is true only in the boot that follows a deep sleep (not after power on, the RUN pin, the watchdog or an upload), and
+  ``deepSleepWakeReason()`` says whether the timer or the pin woke the chip.
+* ``LOWPOWER_RETAINED(name)`` puts a variable in a linker section (``.persistent_data``) that the start-up code leaves alone and that the SDK zeroes on
+  every reset that is not a wake from deep sleep.  It must not have an initializer (other than zero).  The section is placed after ``.bss``; a sketch without a retained variable
+  pays nothing (the heap starts right after ``.bss``).  Its SRAM bank stays powered during the sleep (0.05 mA more: 0.15 mA without any retained variable, 0.2 mA with);
+  keep it small: it has to end inside the first 256 KB bank of SRAM (the link fails otherwise).  On the RP2040 the macro is an ordinary variable and
+  the deep sleep calls return ``PICO_ERROR_NOT_PERMITTED``.
+* Pins are parked as in dormant and not restored (the chip reboots); configure them again in ``setup()``.  On a Pico W / Pico 2 W the WiFi chip is switched off
+  first (WL_ON low; left on, a connected chip would keep drawing about 47 mA through the sleep) with the driver's lock held, as in ``sleepFor``, so that the
+  driver's worker (WiFi or Bluetooth) cannot touch the chip while it is switched off.  The connection and a Bluetooth stack are gone after the wake: start them again in ``setup()``.
+* Use an external pull-down for a RISING wake pin (RP2350-E9, above).
+* In a build with FreeRTOS both calls return ``PICO_ERROR_NOT_PERMITTED`` like every other sleep call.
+* Plain Pico 2 (no CYW43): 100 timed wakes of 1 s and 30 pin wakes on GP15 (RISING, a pin the sketch never configured) all gave the right reason, a clean ``setup()`` and the
+  retained counter 1, 2, 3 ... without a gap; a RUN reset and a power cycle give a cold boot (counter 0).  Floor 0.175 mA without and 0.225 mA with a retained variable
+  (Pico 2 W: 0.15 and 0.20 mA).
+* The first 10 KB of SRAM are not usable for retained data.  The OTA stub (``ota.o``) that the core links at the start of every RP2350 image is a copy-to-RAM program: at every boot, power-up and wake
+  from deep sleep alike, it copies itself to SRAM and clears its bss before it starts the sketch.  On the rp2350 Arm build that is 0x20000110 to 0x200028DC (measured: a probe
+  filled before the sleep changed in exactly that range after every wake, and not at all in an image linked without the stub); the stub tables give 0x20002CB4 for the RISC-V build.
+  A retained variable there would read garbage after the wake (on a plain Pico 2 data at 0x200027f0 was lost, at 0x20002bf0 and higher it survived; the Pico 2 W builds put it higher
+  because of the CYW43's ``.bss`` and were never affected).  So when a sketch has retained variables the linker script places ``.persistent_data`` at 0x20003000 or above; the gap between the end
+  of ``.bss`` and 0x20003000 (at most about 3 KB, and only for a very small sketch) is then not heap.  If ``ota.o`` is ever rebuilt larger,
+  the floor in ``lib/rp2350*/memmap_default.ld`` has to be checked.  The same range cannot hold anything that must survive a reboot, such as an ``.uninitialized_data`` variable (the section
+  starts at 0x20000110).  The POWMAN scratch registers and everything above the stub survive a deep sleep.
+
+Time across deep sleep (RP2350)
+-------------------------------
+
+``LowPower.setTime(epoch)`` starts the always-on (POWMAN) timer at that Unix time and sets the system time; the timer keeps counting through deep sleep, dormant and
+light sleep, and when it is running at start-up the system time (``time()``, ``gettimeofday()``) is taken from it.  So ``time()`` is right after every wake without a
+resync; ``timeValid()`` says whether the timer is running.  Set it once from NTP, a host or the user (the ``DeepSleepClock`` example uses the compile time).
+
+* The timer is lost by a power-up and by a RUN-pin reset, not by deep sleep or the watchdog.  ``millis()`` restarts at 0 after a deep sleep, ``time()`` does not.
+* Awake and in light sleep it counts from the crystal (the library keeps the timer's clock running in ``sleepFor`` and ``sleepUntilPin``; without that it stopped).  In
+  deep sleep and dormant the crystal is off and it counts from the on-chip low-power oscillator, which on the chip measured ran **0.54 % slow** (10 s sleeps for 30 minutes:
+  1793.0 s counted for 1802.6 s of host time; 20 s per hour, 8 minutes per day).  Calibrating the oscillator against the crystal while awake does not see it (it reads the
+  same 31.2 kHz the SDK takes from the chip's OTP: the oscillator is slower in deep sleep than awake), so use NTP now and then, or measure the error of your board once and set
+  ``LowPower.setTimeTrimPpm(5400)`` (positive = counts faster; kept in POWMAN scratch register 5, lost at power-up): with that trim the same 10 s deep sleeps ran within
+  **+108 ppm** over 15 minutes (about 9 s per day).  The trim is per chip (another Pico 2 W ran 0.38 % slow with the same value) and applies to **deep sleep only**: awake and in light sleep the timer counts from the
+  crystal (not trimmed), and in dormant the same oscillator ran about **0.1 to 0.3 % fast** with the plain OTP value (1500 and 2200 ppm on two days; 6900 ppm fast with the deep-sleep trim), so dormant always uses the
+  untrimmed value.  That rate changes with temperature and there is no separate dormant trim: for timekeeping use deep or light sleep, or resync the time (NTP, an RTC) after dormant
+  (1500 to 2200 ppm is 5 to 8 s per hour spent in dormant).
+* ``dormantFor`` and ``dormantUntilPin`` keep the time too (the system timer stops in dormant; the library resyncs it from the always-on timer on return and runs the
+  always-on timer from the low-power oscillator while dormant): 20 cycles each on the plain Pico 2 agreed with the host to better than 0.2 s.
+* The deep-sleep floor is the same with the timer running (0.175 mA).  On the RP2040 ``setTime()`` does nothing (``timeValid()`` is false); it has an RTC but this library does not use it yet.
+
+Supply voltage
+--------------
+
+``LowPower.readVsys()`` returns VSYS in volts from GP29 (VSYS / 3 through a 200 k + 100 k divider on the Pico and Pico 2, always connected, about 12 uA at 3.7 V).  It averages 16
+readings.  Measured on a Pico 2 against a PPK2 source from 3.2 to 5.0 V the untrimmed value is 50 to 69 mV (1.4 %) low and the noise 3 to 7 mV; with
+``LowPower.setVsysTrim(0.995, 0.077)`` the error is within 12 mV.  The reading stays proportional down to a 1.6 V supply (the 3.3 V rail holds; the board quit between 1.5 and 1.4 V and
+came back cleanly with a power-on reset, the RP2350's brown-out detector never fired because it watches the 1.1 V core, not VSYS), so the end of a battery has to be decided in software.
+The ADC costs 0.15 mA while enabled (it stays on after the call).  On a Pico W / Pico 2 W GP29 is shared with the WiFi chip:
+``readVsys()`` returns NAN while the chip is powered (call ``WiFi.powerOff()`` first); with the chip off it sets GP29 up as an ADC pin on every call and drives the chip's select line (GPIO25) high for the
+conversions, restoring it afterwards (without that the Pico W reads 0.04 V instead of VSYS).  The first conversions after the ADC is switched on read about 3 % low (a 67 k source), the call waits for that.
+
 Examples
 --------
 
@@ -272,3 +369,6 @@ Examples
 * ``SleepPinOrTimeout`` - light sleep until a pin or a timeout.
 * ``DormantUntilPin`` - go dormant until GP15 is pulled low.
 * ``KeepRunningPWM`` - keep a PWM output running during a ``sleepFor``.
+* ``DeepSleepCounter`` - RP2350: deep sleep for 10 seconds in a loop, a retained wake counter.
+* ``DeepSleepUntilPin`` - RP2350: deep sleep until GP15 is pulled low.
+* ``DeepSleepClock`` - RP2350: wall-clock time that survives deep sleep.
