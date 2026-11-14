@@ -244,10 +244,27 @@ SECTIONS
         __bss_end__ = .;
     } > RAM
 
-    /* pico_low_power (Pstate) references these. The core has no persistent-data
-       section yet, so provide an empty one. */
-    PROVIDE(__persistent_data_start__ = __bss_end__);
-    PROVIDE(__persistent_data_end__ = __bss_end__);
+    /* pico_low_power (Pstate): data that survives a deep sleep (switched-core power-down).  Not cleared by crt0 (NOLOAD, outside .bss); the SDK's
+       runtime init zeroes it on every reset that is not a Pstate wake.  LOWPOWER_RETAINED(name) puts a variable here. */
+    /* Low-SRAM floor, only when the sketch has retained data (size of .persistent_data > 0).  The arduino-pico OTA stub (ota.o, linked at the start of the flash image) is a copy-to-RAM
+       binary: at every boot, power-up and deep-sleep wake alike, it copies itself to SRAM and clears its bss before it chains to the sketch.  Measured on a plain Pico 2:
+       0x20000110 to 0x200028DC for ota.o of rp2350; the ota.o tables give 0x20002CB4 for rp2350-riscv (RP2040 0x20002AF0).  Retained data below that is lost at every wake, so it is placed
+       at 0x3000 or above (OTA_RAM_END, covers all three).  If ota.o is rebuilt larger, re-check the copy and bss tables in the blob.  The same range is lost by anything
+       else that must survive a reboot, e.g. .uninitialized_data, which starts at 0x20000110.  Without retained variables the section is empty and the heap starts right after .bss. */
+    .persistent_floor (NOLOAD) : {
+        . = (SIZEOF(.persistent_data) > 0) ? MAX(ABSOLUTE(.), ORIGIN(RAM) + 0x3000) : ABSOLUTE(.);
+    } > RAM
+
+    .persistent_data (NOLOAD) : {
+        . = ALIGN(4);
+        __persistent_data_start__ = .;
+        *(.persistent_data*)
+        . = ALIGN(4);
+        __persistent_data_end__ = .;
+    } > RAM
+
+    /* the SDK keeps SRAM bank 0 (the first 256 KB) powered for data in this section: it has to end inside it */
+    ASSERT(__persistent_data_end__ <= ORIGIN(RAM) + 0x40000, "LOWPOWER_RETAINED data does not fit into SRAM bank 0 (first 256 KB)")
 
     .heap (NOLOAD):
     {
