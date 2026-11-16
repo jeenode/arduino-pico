@@ -384,7 +384,7 @@ bool WiFiClass::powerOff() {
     if (!rp2040.isPicoW()) {
         return false;
     }
-    if (_cywOff) {
+    if (__cyw43PoweredOff()) {
         return true;
     }
     disconnectAP();
@@ -392,7 +392,7 @@ bool WiFiClass::powerOff() {
     cyw43_arch_lwip_begin();
     cyw43_deinit(&cyw43_state); // WL_ON low, PIO and DMA released, driver state reset; the async context and lwIP stay up
     cyw43_arch_lwip_end();
-    _cywOff = true;
+    __cyw43SetOffRequested(true);
     return true;
 }
 
@@ -400,7 +400,7 @@ bool WiFiClass::powerOn(bool reconnect, uint32_t timeoutMs) {
     if (!rp2040.isPicoW()) {
         return false;
     }
-    _cywOff = false;
+    __cyw43SetOffRequested(false);
     if (!reconnect || _ssid.length() == 0) {
         cyw43_arch_enable_sta_mode(); // powers the chip up and loads its firmware
         return true;

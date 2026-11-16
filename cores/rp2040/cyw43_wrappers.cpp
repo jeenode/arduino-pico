@@ -167,6 +167,36 @@ extern "C" void init_cyw43_wifi() {
 extern "C" void __pinMode(pin_size_t pin, PinMode mode);
 extern "C" void __digitalWrite(pin_size_t pin, PinStatus val);
 extern "C" PinStatus __digitalRead(pin_size_t pin);
+extern void __clearADCPin(pin_size_t p);
+
+// WiFi.powerOff() is in effect: set by powerOff(), cleared by powerOn().  The driver powers the chip up again by itself when a call needs it
+// (WiFi.begin(), a scan, an LED write), so the chip counts as off only while WL_ON is low as well.  WiFi.isPoweredOn() and the GPIO check
+// below read this one place.
+static bool __cywOffRequested = false;
+
+extern "C" bool __cyw43PoweredOff() {
+    return __cywOffRequested && !gpio_get_out_level(CYW43_PIN_WL_REG_ON);
+}
+
+extern "C" void __cyw43SetOffRequested(bool off) {
+    __cywOffRequested = off;
+    if (off && (CYW43_PIN_WL_CS == 25) && (CYW43_PIN_WL_CLOCK == 29)) {
+        // Pico W / Pico 2 W: VSYS / 3 is on GPIO29, which is the chip's clock while it is powered, and the divider only reads true while GPIO25
+        // (the chip's select line, high when idle) is high.  Leave both as analogRead(29) needs them.
+        gpio_init(CYW43_PIN_WL_CS);
+        gpio_set_dir(CYW43_PIN_WL_CS, GPIO_OUT);
+        gpio_put(CYW43_PIN_WL_CS, 1);
+        __clearADCPin(CYW43_PIN_WL_CLOCK);
+    }
+}
+
+// What a CYW43 GPIO call (LED_BUILTIN and the chip's other GPIOs, pins 64 and up) does while WiFi.powerOff() is in effect.  The chip cannot answer:
+// panic with a message rather than a silent LED that never lights.  Making it a silent no-op instead is a change in this one function.
+static void __cywGpioOffCheck(pin_size_t pin) {
+    if (__cyw43PoweredOff()) {
+        panic("CYW43 GPIO %d (pin %d) used while WiFi.powerOff() is in effect; call WiFi.powerOn() first", pin - 64, pin);
+    }
+}
 
 extern "C" void cyw43_pinMode(pin_size_t pin, PinMode mode) {
 #if defined PIN_LED
@@ -190,6 +220,7 @@ extern "C" void cyw43_digitalWrite(pin_size_t pin, PinStatus val) {
     if (pin < 64) {
         __digitalWrite(pin, val);
     } else {
+        __cywGpioOffCheck(pin);
         cyw43_arch_gpio_put(pin - 64, val == HIGH ? 1 : 0);
     }
 }
@@ -203,6 +234,7 @@ extern "C" PinStatus cyw43_digitalRead(pin_size_t pin) {
     if (pin < 64) {
         return __digitalRead(pin);
     } else {
+        __cywGpioOffCheck(pin);
         return cyw43_arch_gpio_get(pin - 64) ? HIGH : LOW;
     }
 }

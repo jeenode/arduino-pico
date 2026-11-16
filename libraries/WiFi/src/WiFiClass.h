@@ -25,6 +25,7 @@
 #include <Arduino.h>
 #if defined(PICO_CYW43_SUPPORTED)
 #include <lwIP_CYW43.h>
+#include <cyw43_wrappers.h>
 #elif defined(ESPHOSTSPI)
 #include <lwIP_ESPHost.h>
 #elif defined(WINC1501_SPI)
@@ -256,6 +257,10 @@ public:
         The chip carries Bluetooth as well as WiFi: this powers all of it off, so a Bluetooth link and advertising end too.  powerOn() restores WiFi only; a sketch
         that uses Bluetooth has to start the Bluetooth stack again after powerOn().
 
+        While the chip is off, LED_BUILTIN and the chip's other GPIOs (pins 64 and up, digitalWrite() / digitalRead(), VBUS sense included) are not available:
+        they stop the sketch with a panic message until powerOn().  VSYS stays readable with analogRead(29).  A call that needs the radio (begin(), a scan,
+        softAP(), macAddress()) powers the chip up again by itself, and isPoweredOn() is true from then on.
+
         return: true if the chip is off (also when it was off already), false if there is no CYW43 chip on this board (the call is declared on every board and does nothing there)
     */
     bool powerOff();
@@ -270,11 +275,11 @@ public:
     bool powerOn(bool reconnect = true, uint32_t timeoutMs = 15000);
 
     /*
-        return: false after powerOff() until powerOn(), and always false on a board without the CYW43 chip
+        return: false while the chip is off after powerOff() (until powerOn(), or until a call that needs the radio powers it up), and always false on a board without the CYW43 chip
     */
     bool isPoweredOn() const {
 #if defined(PICO_CYW43_SUPPORTED)
-        return !_cywOff;
+        return !__cyw43PoweredOff();
 #else
         return false;
 #endif
@@ -472,7 +477,6 @@ private:
     uint8_t _bssid[6];
     String _password;
     bool _wifiHWInitted = false;
-    bool _cywOff = false;
 
     // AP hardware and credentials
     bool _apHWInitted = false;
