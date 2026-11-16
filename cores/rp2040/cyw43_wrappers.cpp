@@ -167,7 +167,6 @@ extern "C" void init_cyw43_wifi() {
 extern "C" void __pinMode(pin_size_t pin, PinMode mode);
 extern "C" void __digitalWrite(pin_size_t pin, PinStatus val);
 extern "C" PinStatus __digitalRead(pin_size_t pin);
-extern void __clearADCPin(pin_size_t p);
 
 // WiFi.powerOff() is in effect: set by powerOff(), cleared by powerOn().  The driver powers the chip up again by itself when a call needs it
 // (WiFi.begin(), a scan, an LED write), so the chip counts as off only while WL_ON is low as well.  WiFi.isPoweredOn() and the GPIO check
@@ -180,13 +179,29 @@ extern "C" bool __cyw43PoweredOff() {
 
 extern "C" void __cyw43SetOffRequested(bool off) {
     __cywOffRequested = off;
-    if (off && (CYW43_PIN_WL_CS == 25) && (CYW43_PIN_WL_CLOCK == 29)) {
-        // Pico W / Pico 2 W: VSYS / 3 is on GPIO29, which is the chip's clock while it is powered, and the divider only reads true while GPIO25
-        // (the chip's select line, high when idle) is high.  Leave both as analogRead(29) needs them.
-        gpio_init(CYW43_PIN_WL_CS);
-        gpio_set_dir(CYW43_PIN_WL_CS, GPIO_OUT);
-        gpio_put(CYW43_PIN_WL_CS, 1);
-        __clearADCPin(CYW43_PIN_WL_CLOCK);
+}
+
+// analogRead(29) is VSYS / 3 on the Pico W / Pico 2 W.  The divider (R5 20 kOhm, then Q1, then R6 10 kOhm to ground) is connected by Q1, whose gate is GPIO25 (the
+// chip's select line), and GPIO29 is the chip's clock while the chip is powered.  With the chip off, analogRead(29) turns the divider on for the read only (it draws
+// about 0.12 mA at 3.7 V while it is on) and gives GPIO25 back as an input; the divider is settled a few microseconds after GPIO25 goes high.
+extern "C" bool __cyw43VsysReadBegin(pin_size_t pin) {
+    if ((CYW43_PIN_WL_CS != 25) || (CYW43_PIN_WL_CLOCK != 29) || (pin != CYW43_PIN_WL_CLOCK) || !__cyw43PoweredOff()) {
+        return false;
+    }
+    gpio_init(CYW43_PIN_WL_CS);
+    gpio_set_dir(CYW43_PIN_WL_CS, GPIO_OUT);
+    gpio_put(CYW43_PIN_WL_CS, 1);
+    adc_gpio_init(CYW43_PIN_WL_CLOCK); // the chip's clock pin (a PIO pin) back to an ADC input
+    busy_wait_us(50);
+    return true;
+}
+
+extern "C" void __cyw43VsysReadEnd(bool switched) {
+    if (switched) {
+        gpio_put(CYW43_PIN_WL_CS, 0);                 // discharge the FET's gate (it stays on while the pin floats with the gate charged), then release the pin as the driver left it
+        busy_wait_us(5);
+        gpio_set_dir(CYW43_PIN_WL_CS, GPIO_IN);
+        gpio_set_function(CYW43_PIN_WL_CS, GPIO_FUNC_NULL);
     }
 }
 

@@ -25,6 +25,9 @@
 #include <hardware/clocks.h>
 #include <hardware/pll.h>
 #include <hardware/adc.h>
+#if defined(PICO_CYW43_SUPPORTED)
+#include <cyw43_wrappers.h>
+#endif
 
 void __clearADCPin(pin_size_t p);
 
@@ -147,6 +150,9 @@ extern "C" int analogRead(pin_size_t pin) {
         adc_init();
         adcInitted = true;
     }
+#if defined(PICO_CYW43_SUPPORTED)
+    const bool vsysSwitched = __cyw43VsysReadBegin(pin); // VSYS with the WiFi chip off: the divider is on during the read only
+#endif
     if (!(_adcGPIOInit & (1LL << pin))) {
         adc_gpio_init(pin);
         _adcGPIOInit |= 1LL << pin;
@@ -155,7 +161,11 @@ extern "C" int analogRead(pin_size_t pin) {
         adc_select_input(pin - minPin);
         _lastADCMux = pin;
     }
-    return (_readBits < 12) ? adc_read() >> (12 - _readBits) : adc_read() << (_readBits - 12);
+    const int raw = adc_read();
+#if defined(PICO_CYW43_SUPPORTED)
+    __cyw43VsysReadEnd(vsysSwitched);
+#endif
+    return (_readBits < 12) ? raw >> (12 - _readBits) : raw << (_readBits - 12);
 }
 
 extern "C" float analogReadTemp(float vref) {

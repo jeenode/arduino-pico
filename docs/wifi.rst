@@ -58,7 +58,7 @@ WiFi is not needed (a sleep of more than about 10 seconds, see below) power the 
 * While the chip is off, ``LED_BUILTIN`` and the chip's other GPIOs (pins 64 and up: ``digitalWrite()`` and ``digitalRead()``, which includes the VBUS sense on CYW43 GPIO 2)
   are not available: the sketch stops with a panic message (``CYW43 GPIO 0 (pin 64) used while WiFi.powerOff() is in effect; call WiFi.powerOn() first``) instead of a
   hang or an LED that silently does nothing.  ``pinMode()`` on those pins does nothing, as always.  ``isPoweredOn()`` is how a sketch (or a library) asks.  VSYS stays readable with ``analogRead(29)``
-  (with the default 10 bit resolution; ``VSYS = reading * 3 * 3.3 V / 1024``).  A call that needs the radio (``begin()``, a scan, ``softAP()``, ``macAddress()``) powers the chip up again by itself
+  (with the default 10 bit resolution; ``VSYS = reading * 3 * 3.3 V / 1024``): with the chip off ``analogRead()`` turns the divider on for the read only (its transistor is gated by GPIO25, the chip's select line; the divider draws about 0.12 mA at 3.7 V while it is on) and gives GPIO25 back as an input.  A call that needs the radio (``begin()``, a scan, ``softAP()``, ``macAddress()``) powers the chip up again by itself
   (about 0.5 s for the firmware load, and the board current is back up), and ``isPoweredOn()`` is true from then on: call ``powerOn()`` when you mean it.
 * Sockets and server objects do not survive: re-create them after ``powerOn()``.
 * Timing, Pico 2 W: the chip is up and joined after about 6.8 s (firmware load about 0.4 s, the rest is scan,

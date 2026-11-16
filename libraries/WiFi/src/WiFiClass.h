@@ -258,7 +258,7 @@ public:
         that uses Bluetooth has to start the Bluetooth stack again after powerOn().
 
         While the chip is off, LED_BUILTIN and the chip's other GPIOs (pins 64 and up, digitalWrite() / digitalRead(), VBUS sense included) are not available:
-        they stop the sketch with a panic message until powerOn().  VSYS stays readable with analogRead(29).  A call that needs the radio (begin(), a scan,
+        they stop the sketch with a panic message until powerOn().  VSYS stays readable with analogRead(29) (it switches the voltage divider on for the read only).  A call that needs the radio (begin(), a scan,
         softAP(), macAddress()) powers the chip up again by itself, and isPoweredOn() is true from then on.
 
         return: true if the chip is off (also when it was off already), false if there is no CYW43 chip on this board (the call is declared on every board and does nothing there)

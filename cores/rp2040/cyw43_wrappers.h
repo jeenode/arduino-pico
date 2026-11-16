@@ -32,6 +32,8 @@ void cyw43_digitalWrite(pin_size_t pin, PinStatus val);
 PinStatus cyw43_digitalRead(pin_size_t pin);
 bool __cyw43PoweredOff();                  // WiFi.powerOff() is in effect and the chip is off (WL_ON low)
 void __cyw43SetOffRequested(bool off);     // WiFi.powerOff() / powerOn()
+bool __cyw43VsysReadBegin(pin_size_t pin); // analogRead(29) with the chip off: divider on, true when it was switched
+void __cyw43VsysReadEnd(bool switched);    // ... and off again
 #ifdef __cplusplus
 }
 #endif
